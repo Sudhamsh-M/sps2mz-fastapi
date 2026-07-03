@@ -11,6 +11,7 @@ app = FastAPI()
 # === CORS (Middleware 2) ===
 ALLOWED_CORS_ORIGINS = [
     "https://app-sps2mz.example.com",
+    "hhtps://exam.sanand.workers.dev",
     # Add the exam page origin here when you know it, e.g.:
     # "https://exam.example.com",
 ]
