@@ -1,26 +1,16 @@
 import uuid
 import time
 from typing import Dict, List
-from fastapi import FastAPI, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-# === 1. CORS CONFIGURATION (Must wrap everything) ===
-ALLOWED_CORS_ORIGINS = [
+# === 1. CORS CONFIGURATION ===
+ALLOWED_CORS_ORIGINS = {
     "https://app-sps2mz.example.com",
     "https://exam.sanand.workers.dev",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Request-ID"], # Ensures the browser can read it
-)
+}
 
 # === Rate Limiting State ===
 rate_limit_buckets: Dict[str, List[float]] = {}
@@ -44,7 +34,6 @@ def is_allowed(client_id: str) -> bool:
     return True
 
 # === COMBINED HTTP MIDDLEWARE STACK ===
-# This native approach processes top-to-bottom and guarantees CORS works everywhere.
 @app.middleware("http")
 async def process_middleware_stack(request: Request, call_next):
     # --- Middleware A: Request Context (Inbound) ---
@@ -55,22 +44,52 @@ async def process_middleware_stack(request: Request, call_next):
     # Store it in request state so our endpoints can access it
     request.state.request_id = request_id
 
-    # --- Middleware B: Rate Limiting ---
-    # The grader checks both case-sensitive and case-insensitive headers
-    client_id = request.headers.get("x-client-id") or request.headers.get("X-Client-Id") or "unknown"
+    # Get the incoming origin to check for CORS permissions
+    origin = request.headers.get("origin")
+
+    # --- Middleware B: Handle CORS Preflight (OPTIONS) ---
+    # Crucial: Return early for OPTIONS requests and DO NOT count them toward rate limits
+    if request.method == "OPTIONS":
+        response = Response(status_code=status.HTTP_200_OK)
+        if origin in ALLOWED_CORS_ORIGINS:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "X-Request-ID, X-Client-Id, Content-Type"
+            response.headers["Access-Control-Expose-Headers"] = "X-Request-ID"
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    # --- Middleware C: Rate Limiting ---
+    # If no client ID header is present, assign a random unique string so it 
+    # doesn't share a bucket with other clean requests and cause an instant 429 lock
+    client_id = request.headers.get("x-client-id") or request.headers.get("X-Client-Id")
+    if not client_id:
+        client_id = f"anonymous-{uuid.uuid4()}"
     
     if not is_allowed(client_id):
-        # We return a standard Response so FastAPI's CORS layer can process it
-        response = Response(content="Rate limit exceeded", status_code=429)
+        response = JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded"}
+        )
+        if origin in ALLOWED_CORS_ORIGINS:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Expose-Headers"] = "X-Request-ID"
         response.headers["X-Request-ID"] = request_id
         return response
 
     # --- Proceed to Endpoint ---
     response = await call_next(request)
 
-    # --- Middleware A: Request Context (Outbound) ---
-    # Always append the request ID to the outbound response header
+    # --- Outbound Modifications (Context & CORS) ---
     response.headers["X-Request-ID"] = request_id
+    
+    if origin in ALLOWED_CORS_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Expose-Headers"] = "X-Request-ID"
+        
     return response
 
 # === Endpoint ===
